@@ -3,6 +3,7 @@ use serde::{Deserialize, Serialize};
 use serde_json::{json, Value};
 use std::collections::BTreeMap;
 use std::time::Duration;
+use std::time::Instant;
 
 #[derive(Debug, Deserialize)]
 #[serde(rename_all = "camelCase")]
@@ -19,6 +20,7 @@ struct ClickHouseConnectionInput {
 struct ClickHouseTableRow {
     database: String,
     name: String,
+    total_rows: Option<u64>,
 }
 
 #[derive(Debug, Deserialize)]
@@ -44,6 +46,8 @@ struct TablePreviewInput {
     schema: String,
     table: String,
     limit: Option<u32>,
+    sort_column: Option<String>,
+    sort_direction: Option<String>,
 }
 
 #[derive(Debug, Deserialize)]
@@ -54,11 +58,29 @@ struct QueryInput {
     limit: Option<u32>,
 }
 
+#[derive(Debug, Deserialize)]
+struct ClickHouseStatusRow {
+    version: String,
+    current_database: String,
+}
+
+#[derive(Debug, Deserialize)]
+struct ClickHouseStatusResult {
+    data: Vec<ClickHouseStatusRow>,
+}
+
 #[derive(Debug, Serialize)]
 #[serde(rename_all = "camelCase")]
 struct SchemaTables {
     schema: String,
-    tables: Vec<String>,
+    tables: Vec<SchemaTableEntry>,
+}
+
+#[derive(Debug, Serialize)]
+#[serde(rename_all = "camelCase")]
+struct SchemaTableEntry {
+    name: String,
+    row_count: Option<u64>,
 }
 
 #[derive(Debug, Serialize)]
@@ -66,6 +88,15 @@ struct SchemaTables {
 struct TablePreview {
     columns: Vec<String>,
     rows: Vec<Value>,
+}
+
+#[derive(Debug, Serialize)]
+#[serde(rename_all = "camelCase")]
+struct ConnectionStatus {
+    connected: bool,
+    latency_ms: u128,
+    version: String,
+    current_database: String,
 }
 
 fn escape_identifier(identifier: &str) -> String {
@@ -122,10 +153,10 @@ async fn fetch_schema_tables(
         Some(database) if !database.trim().is_empty() => {
             let escaped_database = database.trim().replace('\'', "''");
             format!(
-                "SELECT database, name FROM system.tables WHERE database = '{escaped_database}' ORDER BY name FORMAT JSON"
+                "SELECT database, name, total_rows FROM system.tables WHERE database = '{escaped_database}' ORDER BY name FORMAT JSON"
             )
         }
-        _ => "SELECT database, name FROM system.tables WHERE database NOT IN ('INFORMATION_SCHEMA', 'information_schema', 'system') ORDER BY database, name FORMAT JSON".to_string(),
+        _ => "SELECT database, name, total_rows FROM system.tables WHERE database NOT IN ('INFORMATION_SCHEMA', 'information_schema', 'system') ORDER BY database, name FORMAT JSON".to_string(),
     };
 
     let response = run_clickhouse_query(&input, query).await?;
@@ -135,10 +166,16 @@ async fn fetch_schema_tables(
         .await
         .map_err(|err| format!("Could not parse ClickHouse response: {err}"))?;
 
-    let mut grouped: BTreeMap<String, Vec<String>> = BTreeMap::new();
+    let mut grouped: BTreeMap<String, Vec<SchemaTableEntry>> = BTreeMap::new();
 
     for row in result.data {
-        grouped.entry(row.database).or_default().push(row.name);
+        grouped
+            .entry(row.database)
+            .or_default()
+            .push(SchemaTableEntry {
+                name: row.name,
+                row_count: row.total_rows,
+            });
     }
 
     let schemas = grouped
@@ -162,10 +199,27 @@ async fn fetch_table_preview(input: TablePreviewInput) -> Result<TablePreview, S
     }
 
     let limit = input.limit.unwrap_or(200).clamp(1, 1000);
+    let order_clause = match input.sort_column {
+        Some(column) if !column.trim().is_empty() => {
+            let direction = match input.sort_direction.as_deref() {
+                Some("desc") | Some("DESC") => "DESC",
+                _ => "ASC",
+            };
+
+            format!(
+                " ORDER BY `{}` {}",
+                escape_identifier(column.trim()),
+                direction
+            )
+        }
+        _ => String::new(),
+    };
+
     let query = format!(
-        "SELECT * FROM `{}`.`{}` LIMIT {} FORMAT JSON",
+        "SELECT * FROM `{}`.`{}`{} LIMIT {} FORMAT JSON",
         escape_identifier(schema),
         escape_identifier(table),
+        order_clause,
         limit
     );
 
@@ -176,7 +230,11 @@ async fn fetch_table_preview(input: TablePreviewInput) -> Result<TablePreview, S
         .await
         .map_err(|err| format!("Could not parse ClickHouse response: {err}"))?;
 
-    let columns = preview_result.meta.into_iter().map(|col| col.name).collect();
+    let columns = preview_result
+        .meta
+        .into_iter()
+        .map(|col| col.name)
+        .collect();
 
     Ok(TablePreview {
         columns,
@@ -211,7 +269,11 @@ async fn run_query(input: QueryInput) -> Result<TablePreview, String> {
         .map_err(|err| format!("Could not read ClickHouse response: {err}"))?;
 
     if let Ok(preview_result) = serde_json::from_str::<ClickHousePreviewResult>(&body) {
-        let columns = preview_result.meta.into_iter().map(|col| col.name).collect();
+        let columns = preview_result
+            .meta
+            .into_iter()
+            .map(|col| col.name)
+            .collect();
         return Ok(TablePreview {
             columns,
             rows: preview_result.data,
@@ -230,6 +292,37 @@ async fn run_query(input: QueryInput) -> Result<TablePreview, String> {
     })
 }
 
+#[tauri::command]
+async fn fetch_connection_status(
+    input: ClickHouseConnectionInput,
+) -> Result<ConnectionStatus, String> {
+    let started = Instant::now();
+    let response = run_clickhouse_query(
+        &input,
+        "SELECT version() AS version, currentDatabase() AS current_database FORMAT JSON"
+            .to_string(),
+    )
+    .await?;
+
+    let result: ClickHouseStatusResult = response
+        .json()
+        .await
+        .map_err(|err| format!("Could not parse ClickHouse response: {err}"))?;
+
+    let row = result
+        .data
+        .into_iter()
+        .next()
+        .ok_or_else(|| "Could not read ClickHouse status".to_string())?;
+
+    Ok(ConnectionStatus {
+        connected: true,
+        latency_ms: started.elapsed().as_millis(),
+        version: row.version,
+        current_database: row.current_database,
+    })
+}
+
 #[cfg_attr(mobile, tauri::mobile_entry_point)]
 pub fn run() {
     tauri::Builder::default()
@@ -237,7 +330,8 @@ pub fn run() {
         .invoke_handler(tauri::generate_handler![
             fetch_schema_tables,
             fetch_table_preview,
-            run_query
+            run_query,
+            fetch_connection_status
         ])
         .run(tauri::generate_context!())
         .expect("error while running tauri application");

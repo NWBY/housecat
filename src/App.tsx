@@ -1,4 +1,4 @@
-import { FormEvent, KeyboardEvent, useMemo, useRef, useState } from "react";
+import { FormEvent, useMemo, useState } from "react";
 import { invoke } from "@tauri-apps/api/core";
 import {
   CaretDown,
@@ -6,13 +6,18 @@ import {
   Database,
   FloppyDisk,
   Plus,
-  Play,
   Table as TableIcon,
   TerminalWindow,
   Trash,
   X,
 } from "@phosphor-icons/react";
-import { Button, Input, Surface, Switch, Table as KumoTable, Tabs } from "@cloudflare/kumo";
+import { Button, Input, Surface, Switch, Tabs } from "@cloudflare/kumo";
+import { AppToast } from "./components/AppToast";
+import { QueryEditor } from "./components/QueryEditor";
+import { ResultTable } from "./components/ResultTable";
+import { TabActions } from "./components/TabActions";
+import { closeTabWithActive, createQueryTab as makeQueryTab, createTableTab, duplicateTab } from "./state/viewerTabs";
+import type { SchemaTableItem, SchemaTables, TablePreview, ViewerTab } from "./types/viewer";
 import "./App.css";
 
 type ConnectionForm = {
@@ -24,26 +29,11 @@ type ConnectionForm = {
   secure: boolean;
 };
 
-type SchemaTables = {
-  schema: string;
-  tables: string[];
-};
-
-type TablePreview = {
-  columns: string[];
-  rows: Record<string, unknown>[];
-};
-
-type ViewerTab = {
-  id: string;
-  type: "table" | "query";
-  title: string;
-  schema?: string;
-  table?: string;
-  query: string;
-  preview: TablePreview;
-  isLoading: boolean;
-  error: string | null;
+type ConnectionStatus = {
+  connected: boolean;
+  latencyMs: number;
+  version: string;
+  currentDatabase: string;
 };
 
 type Screen = "connection" | "viewer";
@@ -68,106 +58,8 @@ type ConnectionPayload = {
   secure: boolean;
 };
 
-type QueryAutocomplete = {
-  open: boolean;
-  items: string[];
-  selectedIndex: number;
-  start: number;
-  end: number;
-};
-
 const SAVED_CONNECTIONS_KEY = "housecat.savedConnections";
-
-const SQL_KEYWORDS = [
-  "SELECT",
-  "FROM",
-  "WHERE",
-  "GROUP BY",
-  "ORDER BY",
-  "LIMIT",
-  "HAVING",
-  "JOIN",
-  "INNER JOIN",
-  "LEFT JOIN",
-  "RIGHT JOIN",
-  "FULL JOIN",
-  "ON",
-  "WITH",
-  "AS",
-  "UNION",
-  "UNION ALL",
-  "DISTINCT",
-  "INSERT INTO",
-  "VALUES",
-  "UPDATE",
-  "DELETE",
-  "CREATE TABLE",
-  "DROP TABLE",
-  "ALTER TABLE",
-  "FORMAT JSON",
-  "COUNT",
-  "SUM",
-  "AVG",
-  "MIN",
-  "MAX",
-  "system.tables",
-  "system.columns",
-  "toDate",
-  "toDateTime",
-  "now()",
-];
-
-function escapeHtml(value: string): string {
-  return value.replace(/&/g, "&amp;").replace(/</g, "&lt;").replace(/>/g, "&gt;");
-}
-
-function highlightSql(query: string): string {
-  const pattern = /(\/\*[\s\S]*?\*\/|--.*$|'(?:''|[^'])*'|\b\d+(?:\.\d+)?\b|\b(?:SELECT|FROM|WHERE|GROUP\s+BY|ORDER\s+BY|LIMIT|HAVING|JOIN|INNER\s+JOIN|LEFT\s+JOIN|RIGHT\s+JOIN|FULL\s+JOIN|ON|WITH|AS|UNION|ALL|DISTINCT|INSERT|INTO|VALUES|UPDATE|DELETE|CREATE|DROP|ALTER|FORMAT|JSON)\b)/gim;
-
-  let result = "";
-  let lastIndex = 0;
-
-  for (const match of query.matchAll(pattern)) {
-    const value = match[0] ?? "";
-    const index = match.index ?? 0;
-
-    result += escapeHtml(query.slice(lastIndex, index));
-
-    if (value.startsWith("--") || value.startsWith("/*")) {
-      result += `<span class="sql-token sql-comment">${escapeHtml(value)}</span>`;
-    } else if (value.startsWith("'")) {
-      result += `<span class="sql-token sql-string">${escapeHtml(value)}</span>`;
-    } else if (/^\d/.test(value)) {
-      result += `<span class="sql-token sql-number">${escapeHtml(value)}</span>`;
-    } else {
-      result += `<span class="sql-token sql-keyword">${escapeHtml(value)}</span>`;
-    }
-
-    lastIndex = index + value.length;
-  }
-
-  result += escapeHtml(query.slice(lastIndex));
-  return result;
-}
-
-function getWordAtCursor(query: string, cursor: number): { start: number; end: number; word: string } {
-  let start = cursor;
-  let end = cursor;
-
-  while (start > 0 && /[a-zA-Z0-9_.]/.test(query[start - 1])) {
-    start -= 1;
-  }
-
-  while (end < query.length && /[a-zA-Z0-9_.]/.test(query[end])) {
-    end += 1;
-  }
-
-  return {
-    start,
-    end,
-    word: query.slice(start, end),
-  };
-}
+const QUERY_HISTORY_KEY = "housecat.queryHistory";
 
 function loadSavedConnections(): SavedConnection[] {
   try {
@@ -206,6 +98,28 @@ function persistSavedConnections(connections: SavedConnection[]) {
   localStorage.setItem(SAVED_CONNECTIONS_KEY, JSON.stringify(connections));
 }
 
+function loadQueryHistory(): string[] {
+  try {
+    const raw = localStorage.getItem(QUERY_HISTORY_KEY);
+    if (!raw) {
+      return [];
+    }
+
+    const parsed = JSON.parse(raw);
+    if (!Array.isArray(parsed)) {
+      return [];
+    }
+
+    return parsed.filter((entry): entry is string => typeof entry === "string").slice(0, 100);
+  } catch {
+    return [];
+  }
+}
+
+function persistQueryHistory(history: string[]) {
+  localStorage.setItem(QUERY_HISTORY_KEY, JSON.stringify(history.slice(0, 100)));
+}
+
 function toConnectionPayload(connection: ConnectionForm): ConnectionPayload {
   return {
     host: connection.host.trim(),
@@ -231,7 +145,38 @@ function normalizeSchemaTables(value: unknown): SchemaTables[] {
       const record = item as { schema?: unknown; tables?: unknown };
       const schema = typeof record.schema === "string" ? record.schema : "";
       const tables = Array.isArray(record.tables)
-        ? record.tables.filter((table): table is string => typeof table === "string")
+        ? record.tables
+            .map((table) => {
+              if (typeof table === "string") {
+                return { name: table, rowCount: null };
+              }
+
+              if (!table || typeof table !== "object") {
+                return null;
+              }
+
+              const tableRecord = table as { name?: unknown; rowCount?: unknown; row_count?: unknown };
+              const name = typeof tableRecord.name === "string" ? tableRecord.name : "";
+              const rowCountValue =
+                typeof tableRecord.rowCount === "number"
+                  ? tableRecord.rowCount
+                  : typeof tableRecord.row_count === "number"
+                    ? tableRecord.row_count
+                    : null;
+
+              if (!name) {
+                return null;
+              }
+
+              return {
+                name,
+                rowCount:
+                  typeof rowCountValue === "number" && Number.isFinite(rowCountValue)
+                    ? Math.max(0, Math.trunc(rowCountValue))
+                    : null,
+              };
+            })
+            .filter((table): table is SchemaTableItem => table !== null)
         : [];
 
       if (!schema) {
@@ -262,30 +207,10 @@ function normalizeTablePreview(value: unknown): TablePreview {
   return { columns, rows };
 }
 
-function formatCellValue(value: unknown): string {
-  if (value === null) {
-    return "null";
-  }
-
-  if (value === undefined) {
-    return "";
-  }
-
-  if (typeof value === "string") {
-    return value;
-  }
-
-  if (typeof value === "number" || typeof value === "boolean") {
-    return String(value);
-  }
-
-  return JSON.stringify(value);
-}
-
 function getFirstTable(schemas: SchemaTables[]): { schema: string; table: string } | null {
   for (const schema of schemas) {
     if (schema.tables.length > 0) {
-      return { schema: schema.schema, table: schema.tables[0] };
+      return { schema: schema.schema, table: schema.tables[0].name };
     }
   }
 
@@ -304,6 +229,7 @@ function App() {
   });
   const [isConnecting, setIsConnecting] = useState(false);
   const [connectionError, setConnectionError] = useState<string | null>(null);
+  const [connectionStatus, setConnectionStatus] = useState<ConnectionStatus | null>(null);
   const [schemaTables, setSchemaTables] = useState<SchemaTables[]>([]);
   const [expandedSchemas, setExpandedSchemas] = useState<Set<string>>(new Set());
   const [tableFilter, setTableFilter] = useState("");
@@ -312,17 +238,18 @@ function App() {
   const [savedConnections, setSavedConnections] = useState<SavedConnection[]>(() =>
     typeof window === "undefined" ? [] : loadSavedConnections(),
   );
+  const [queryHistory, setQueryHistory] = useState<string[]>(() =>
+    typeof window === "undefined" ? [] : loadQueryHistory(),
+  );
   const [connectionName, setConnectionName] = useState("");
-  const [autocomplete, setAutocomplete] = useState<QueryAutocomplete>({
-    open: false,
-    items: [],
-    selectedIndex: 0,
-    start: 0,
-    end: 0,
-  });
-  const editorRef = useRef<HTMLTextAreaElement | null>(null);
-  const highlightRef = useRef<HTMLPreElement | null>(null);
-  const [autocompletePosition, setAutocompletePosition] = useState({ left: 12, top: 28 });
+  const [toastMessage, setToastMessage] = useState<string | null>(null);
+
+  function showToast(message: string) {
+    setToastMessage(message);
+    window.setTimeout(() => {
+      setToastMessage((current) => (current === message ? null : current));
+    }, 1600);
+  }
 
   function getConnectionPayload() {
     return toConnectionPayload(form);
@@ -338,6 +265,19 @@ function App() {
     [viewerTabs, activeTabId],
   );
 
+  const activeTableMeta = useMemo(() => {
+    if (!activeTab || activeTab.type !== "table" || !activeTab.schema || !activeTab.table) {
+      return null;
+    }
+
+    const schemaEntry = schemaTables.find((schema) => schema.schema === activeTab.schema);
+    if (!schemaEntry) {
+      return null;
+    }
+
+    return schemaEntry.tables.find((table) => table.name === activeTab.table) ?? null;
+  }, [activeTab, schemaTables]);
+
   const filteredSchemas = useMemo(() => {
     const query = tableFilter.trim().toLowerCase();
     if (!query) {
@@ -347,251 +287,123 @@ function App() {
     return schemaTables
       .map((schema) => ({
         schema: schema.schema,
-        tables: schema.tables.filter((table) => table.toLowerCase().includes(query)),
+        tables: schema.tables.filter((table) => table.name.toLowerCase().includes(query)),
       }))
       .filter((schema) => schema.tables.length > 0 || schema.schema.toLowerCase().includes(query));
   }, [schemaTables, tableFilter]);
 
   const autocompleteTokens = useMemo(() => {
-    const tokenSet = new Set<string>(SQL_KEYWORDS);
+    const tokenSet = new Set<string>([
+      "SELECT",
+      "FROM",
+      "WHERE",
+      "GROUP BY",
+      "ORDER BY",
+      "LIMIT",
+      "HAVING",
+      "JOIN",
+      "INNER JOIN",
+      "LEFT JOIN",
+      "RIGHT JOIN",
+      "FULL JOIN",
+      "ON",
+      "WITH",
+      "AS",
+      "UNION",
+      "UNION ALL",
+      "DISTINCT",
+      "INSERT INTO",
+      "VALUES",
+      "UPDATE",
+      "DELETE",
+      "CREATE TABLE",
+      "DROP TABLE",
+      "ALTER TABLE",
+      "FORMAT JSON",
+      "COUNT",
+      "SUM",
+      "AVG",
+      "MIN",
+      "MAX",
+      "system.tables",
+      "system.columns",
+      "toDate",
+      "toDateTime",
+      "now()",
+    ]);
 
     for (const schema of schemaTables) {
       tokenSet.add(schema.schema);
       tokenSet.add(`${schema.schema}.`);
       for (const table of schema.tables) {
-        tokenSet.add(table);
-        tokenSet.add(`${schema.schema}.${table}`);
+        tokenSet.add(table.name);
+        tokenSet.add(`${schema.schema}.${table.name}`);
       }
     }
 
     return Array.from(tokenSet);
   }, [schemaTables]);
 
-  const highlightedSql = useMemo(() => {
-    if (!activeTab || activeTab.type !== "query") {
-      return "";
-    }
-
-    return highlightSql(activeTab.query);
-  }, [activeTab]);
-
   function updateTab(tabId: string, updater: (tab: ViewerTab) => ViewerTab) {
     setViewerTabs((prev) => prev.map((tab) => (tab.id === tabId ? updater(tab) : tab)));
   }
 
   function createQueryTab() {
-    const nextIndex = viewerTabs.filter((tab) => tab.type === "query").length + 1;
-    const tabId = `query-${Date.now()}-${nextIndex}`;
-
-    const tab: ViewerTab = {
-      id: tabId,
-      type: "query",
-      title: `Query ${nextIndex}`,
-      query: "SELECT * FROM system.tables LIMIT 50",
-      preview: { columns: [], rows: [] },
-      isLoading: false,
-      error: null,
-    };
-
+    const tab = makeQueryTab(viewerTabs);
     setViewerTabs((prev) => [...prev, tab]);
-    setActiveTabId(tabId);
+    setActiveTabId(tab.id);
   }
 
   function closeTab(tabId: string) {
-    closeAutocomplete();
-    setViewerTabs((prev) => {
-      const closingIndex = prev.findIndex((tab) => tab.id === tabId);
-      if (closingIndex === -1) {
-        return prev;
-      }
-
-      const next = prev.filter((tab) => tab.id !== tabId);
-
-      setActiveTabId((currentActiveId) => {
-        if (currentActiveId !== tabId) {
-          return currentActiveId;
-        }
-
-        if (next.length === 0) {
-          return null;
-        }
-
-        const fallbackIndex = closingIndex > 0 ? closingIndex - 1 : 0;
-        return next[Math.min(fallbackIndex, next.length - 1)]?.id ?? null;
-      });
-
-      return next;
-    });
+    const result = closeTabWithActive(viewerTabs, activeTabId, tabId);
+    setViewerTabs(result.tabs);
+    setActiveTabId(result.activeTabId);
   }
 
-  function closeAutocomplete() {
-    setAutocomplete((prev) => ({ ...prev, open: false, items: [], selectedIndex: 0 }));
-  }
-
-  function updateAutocompletePosition(textarea: HTMLTextAreaElement, cursor: number) {
-    const text = textarea.value;
-    const beforeCursor = text.slice(0, cursor);
-    const lineStart = beforeCursor.lastIndexOf("\n") + 1;
-    const lineText = beforeCursor.slice(lineStart);
-    const lineNumber = beforeCursor.split("\n").length - 1;
-
-    const computed = window.getComputedStyle(textarea);
-    const fontSize = Number.parseFloat(computed.fontSize || "14") || 14;
-    const lineHeight = Number.parseFloat(computed.lineHeight || "0") || fontSize * 1.5;
-    const paddingLeft = Number.parseFloat(computed.paddingLeft || "0") || 0;
-    const paddingTop = Number.parseFloat(computed.paddingTop || "0") || 0;
-
-    const canvas = document.createElement("canvas");
-    const context = canvas.getContext("2d");
-    if (!context) {
+  function renameActiveTab() {
+    if (!activeTab) {
       return;
     }
 
-    context.font = `${computed.fontStyle} ${computed.fontWeight} ${computed.fontSize} ${computed.fontFamily}`;
-    const textWidth = context.measureText(lineText).width;
+    const nextTitle = window.prompt("Rename tab", activeTab.title);
+    if (!nextTitle || !nextTitle.trim()) {
+      return;
+    }
 
-    const left = paddingLeft + textWidth - textarea.scrollLeft;
-    const top = paddingTop + lineNumber * lineHeight - textarea.scrollTop + lineHeight + 4;
-
-    setAutocompletePosition({
-      left: Math.max(8, Math.min(left, textarea.clientWidth - 40)),
-      top: Math.max(8, Math.min(top, textarea.clientHeight - 12)),
-    });
+    updateTab(activeTab.id, (tab) => ({ ...tab, title: nextTitle.trim() }));
   }
 
-  function refreshAutocomplete(
-    query: string,
-    cursor: number,
-    force = false,
-    textarea?: HTMLTextAreaElement | null,
+  function duplicateActiveTab() {
+    if (!activeTab) {
+      return;
+    }
+
+    const result = duplicateTab(viewerTabs, activeTab);
+    setViewerTabs(result.tabs);
+    setActiveTabId(result.activeTabId);
+  }
+
+  function closeOtherTabs() {
+    if (!activeTabId) {
+      return;
+    }
+
+    setViewerTabs((prev) => prev.filter((tab) => tab.id === activeTabId));
+  }
+
+  function closeAllTabs() {
+    setViewerTabs([]);
+    setActiveTabId(null);
+  }
+
+  async function loadTablePreviewIntoTab(
+    tabId: string,
+    schema: string,
+    table: string,
+    sort?: { column: string; direction: "asc" | "desc" },
   ) {
-    if (textarea) {
-      updateAutocompletePosition(textarea, cursor);
-    }
-
-    const { start, end, word } = getWordAtCursor(query, cursor);
-    const normalized = word.toLowerCase();
-
-    if (!force && normalized.length < 1) {
-      closeAutocomplete();
-      return;
-    }
-
-    const items = autocompleteTokens
-      .filter((token) => {
-        const lower = token.toLowerCase();
-        if (!normalized) {
-          return true;
-        }
-        return lower.startsWith(normalized) && lower !== normalized;
-      })
-      .slice(0, 8);
-
-    if (items.length === 0) {
-      closeAutocomplete();
-      return;
-    }
-
-    setAutocomplete({
-      open: true,
-      items,
-      selectedIndex: 0,
-      start,
-      end,
-    });
-  }
-
-  function applyAutocompleteSuggestion(suggestion: string) {
-    if (!activeTab || activeTab.type !== "query") {
-      return;
-    }
-
-    const suffix = /[a-zA-Z0-9_)]$/.test(suggestion) ? " " : "";
-    const nextQuery =
-      activeTab.query.slice(0, autocomplete.start) +
-      suggestion +
-      suffix +
-      activeTab.query.slice(autocomplete.end);
-
-    updateTab(activeTab.id, (tab) => ({ ...tab, query: nextQuery }));
-    closeAutocomplete();
-
-    const nextCursor = autocomplete.start + suggestion.length + suffix.length;
-
-    requestAnimationFrame(() => {
-      editorRef.current?.focus();
-      editorRef.current?.setSelectionRange(nextCursor, nextCursor);
-      if (editorRef.current) {
-        updateAutocompletePosition(editorRef.current, nextCursor);
-      }
-    });
-  }
-
-  function onQueryEditorKeyDown(event: KeyboardEvent<HTMLTextAreaElement>) {
-    if (!activeTab || activeTab.type !== "query") {
-      return;
-    }
-
-    if ((event.ctrlKey || event.metaKey) && event.code === "Space") {
-      event.preventDefault();
-      const cursor = event.currentTarget.selectionStart ?? activeTab.query.length;
-      refreshAutocomplete(activeTab.query, cursor, true, event.currentTarget);
-      return;
-    }
-
-    if (!autocomplete.open) {
-      return;
-    }
-
-    if (event.key === "ArrowDown") {
-      event.preventDefault();
-      setAutocomplete((prev) => ({
-        ...prev,
-        selectedIndex: Math.min(prev.selectedIndex + 1, prev.items.length - 1),
-      }));
-      return;
-    }
-
-    if (event.key === "ArrowUp") {
-      event.preventDefault();
-      setAutocomplete((prev) => ({
-        ...prev,
-        selectedIndex: Math.max(prev.selectedIndex - 1, 0),
-      }));
-      return;
-    }
-
-    if (event.key === "Enter" || event.key === "Tab") {
-      event.preventDefault();
-      const chosen = autocomplete.items[autocomplete.selectedIndex];
-      if (chosen) {
-        applyAutocompleteSuggestion(chosen);
-      }
-      return;
-    }
-
-    if (event.key === "Escape") {
-      event.preventDefault();
-      closeAutocomplete();
-    }
-  }
-
-  function syncQueryScroll() {
-    if (!editorRef.current || !highlightRef.current) {
-      return;
-    }
-
-    highlightRef.current.scrollTop = editorRef.current.scrollTop;
-    highlightRef.current.scrollLeft = editorRef.current.scrollLeft;
-
-    if (autocomplete.open) {
-      const cursor = editorRef.current.selectionStart ?? 0;
-      updateAutocompletePosition(editorRef.current, cursor);
-    }
-  }
-
-  async function loadTablePreviewIntoTab(tabId: string, schema: string, table: string) {
     updateTab(tabId, (tab) => ({ ...tab, isLoading: true, error: null }));
+    const started = performance.now();
 
     try {
       const result = await invoke<unknown>("fetch_table_preview", {
@@ -600,14 +412,21 @@ function App() {
           schema,
           table,
           limit: 200,
+          sortColumn: sort?.column,
+          sortDirection: sort?.direction,
         },
       });
 
+      const normalized = normalizeTablePreview(result);
+
       updateTab(tabId, (tab) => ({
         ...tab,
-        preview: normalizeTablePreview(result),
+        preview: normalized,
         isLoading: false,
         error: null,
+        lastRunMs: Math.max(0, Math.round(performance.now() - started)),
+        lastRowCount: normalized.rows.length,
+        sort,
       }));
     } catch (error) {
       updateTab(tabId, (tab) => ({
@@ -620,22 +439,23 @@ function App() {
   }
 
   function openTableInNewTab(schema: string, table: string) {
-    const tabId = `table-${Date.now()}-${Math.random().toString(16).slice(2, 6)}`;
-    const tab: ViewerTab = {
-      id: tabId,
-      type: "table",
-      title: `${schema}.${table}`,
-      schema,
-      table,
-      query: "",
-      preview: { columns: [], rows: [] },
-      isLoading: true,
-      error: null,
-    };
-
+    const tab = createTableTab(schema, table);
     setViewerTabs((prev) => [...prev, tab]);
-    setActiveTabId(tabId);
-    void loadTablePreviewIntoTab(tabId, schema, table);
+    setActiveTabId(tab.id);
+    void loadTablePreviewIntoTab(tab.id, schema, table);
+  }
+
+  function pushQueryHistoryEntry(query: string) {
+    const normalized = query.trim();
+    if (!normalized) {
+      return;
+    }
+
+    setQueryHistory((prev) => {
+      const next = [normalized, ...prev.filter((entry) => entry !== normalized)].slice(0, 100);
+      persistQueryHistory(next);
+      return next;
+    });
   }
 
   async function runActiveQuery() {
@@ -644,6 +464,7 @@ function App() {
     }
 
     updateTab(activeTab.id, (tab) => ({ ...tab, isLoading: true, error: null }));
+    const started = performance.now();
 
     try {
       const result = await invoke<unknown>("run_query", {
@@ -654,18 +475,166 @@ function App() {
         },
       });
 
+      const normalized = normalizeTablePreview(result);
+
       updateTab(activeTab.id, (tab) => ({
         ...tab,
-        preview: normalizeTablePreview(result),
+        preview: normalized,
         isLoading: false,
         error: null,
+        lastRunMs: Math.max(0, Math.round(performance.now() - started)),
+        lastRowCount: normalized.rows.length,
       }));
+      pushQueryHistoryEntry(activeTab.query);
     } catch (error) {
       updateTab(activeTab.id, (tab) => ({
         ...tab,
         isLoading: false,
         error: typeof error === "string" ? error : "Query failed.",
       }));
+    } finally {
+      void refreshConnectionStatus();
+    }
+  }
+
+  async function sortActiveTabByColumn(column: string) {
+    if (!activeTab) {
+      return;
+    }
+
+    const nextDirection: "asc" | "desc" =
+      activeTab.sort?.column === column && activeTab.sort.direction === "asc" ? "desc" : "asc";
+
+    if (activeTab.preview.rows.length <= 300) {
+      const sortedRows = [...activeTab.preview.rows].sort((left, right) => {
+        const l = left[column];
+        const r = right[column];
+
+        if (l === r) {
+          return 0;
+        }
+
+        if (l === null || l === undefined) {
+          return nextDirection === "asc" ? 1 : -1;
+        }
+
+        if (r === null || r === undefined) {
+          return nextDirection === "asc" ? -1 : 1;
+        }
+
+        if (typeof l === "number" && typeof r === "number") {
+          return nextDirection === "asc" ? l - r : r - l;
+        }
+
+        const lv = String(l).toLowerCase();
+        const rv = String(r).toLowerCase();
+
+        if (lv < rv) {
+          return nextDirection === "asc" ? -1 : 1;
+        }
+
+        if (lv > rv) {
+          return nextDirection === "asc" ? 1 : -1;
+        }
+
+        return 0;
+      });
+
+      updateTab(activeTab.id, (tab) => ({
+        ...tab,
+        preview: { ...tab.preview, rows: sortedRows },
+        sort: { column, direction: nextDirection },
+      }));
+      return;
+    }
+
+    if (activeTab.type === "table" && activeTab.schema && activeTab.table) {
+      await loadTablePreviewIntoTab(activeTab.id, activeTab.schema, activeTab.table, {
+        column,
+        direction: nextDirection,
+      });
+      return;
+    }
+
+    if (activeTab.type === "query") {
+      const raw = activeTab.query.trim().replace(/;\s*$/, "");
+      if (!/^select\s+/i.test(raw)) {
+        showToast("Large-result sorting requires a SELECT query.");
+        return;
+      }
+
+      const wrapped = raw.replace(/\s+format\s+json\s*$/i, "");
+      const sortedQuery = `SELECT * FROM (${wrapped}) AS t ORDER BY \`${column.replace(/`/g, "``")}\` ${nextDirection.toUpperCase()} LIMIT 500`;
+
+      updateTab(activeTab.id, (tab) => ({ ...tab, isLoading: true, error: null }));
+      const started = performance.now();
+
+      try {
+        const result = await invoke<unknown>("run_query", {
+          input: {
+            connection: getConnectionPayload(),
+            query: sortedQuery,
+            limit: 500,
+          },
+        });
+
+        const normalized = normalizeTablePreview(result);
+        updateTab(activeTab.id, (tab) => ({
+          ...tab,
+          preview: normalized,
+          isLoading: false,
+          error: null,
+          sort: { column, direction: nextDirection },
+          lastRunMs: Math.max(0, Math.round(performance.now() - started)),
+          lastRowCount: normalized.rows.length,
+        }));
+      } catch (error) {
+        updateTab(activeTab.id, (tab) => ({
+          ...tab,
+          isLoading: false,
+          error: typeof error === "string" ? error : "Sort query failed.",
+        }));
+      }
+    }
+  }
+
+  async function refreshConnectionStatus(payload?: ConnectionPayload) {
+    try {
+      const result = await invoke<unknown>("fetch_connection_status", {
+        input: payload ?? getConnectionPayload(),
+      });
+
+      if (result && typeof result === "object") {
+        const record = result as {
+          connected?: unknown;
+          latencyMs?: unknown;
+          latency_ms?: unknown;
+          version?: unknown;
+          currentDatabase?: unknown;
+          current_database?: unknown;
+        };
+
+        const latencyValue =
+          typeof record.latencyMs === "number"
+            ? record.latencyMs
+            : typeof record.latency_ms === "number"
+              ? record.latency_ms
+              : 0;
+
+        setConnectionStatus({
+          connected: Boolean(record.connected ?? true),
+          latencyMs: Number.isFinite(latencyValue) ? Math.max(0, Math.round(latencyValue)) : 0,
+          version: typeof record.version === "string" ? record.version : "unknown",
+          currentDatabase:
+            typeof record.currentDatabase === "string"
+              ? record.currentDatabase
+              : typeof record.current_database === "string"
+                ? record.current_database
+                : "unknown",
+        });
+      }
+    } catch {
+      setConnectionStatus(null);
     }
   }
 
@@ -712,6 +681,7 @@ function App() {
 
     try {
       await fetchSchemasAndOpenViewer(payload);
+      await refreshConnectionStatus(payload);
       setScreen("viewer");
     } catch (error) {
       setSchemaTables([]);
@@ -741,6 +711,7 @@ function App() {
         }
         return next;
       });
+      await refreshConnectionStatus();
     } catch (error) {
       setConnectionError(typeof error === "string" ? error : "Refresh failed.");
     } finally {
@@ -755,8 +726,8 @@ function App() {
     setViewerTabs([]);
     setActiveTabId(null);
     setConnectionError(null);
+    setConnectionStatus(null);
     setTableFilter("");
-    closeAutocomplete();
   }
 
   function saveCurrentConnection() {
@@ -971,6 +942,7 @@ function App() {
           ) : null}
           {connectionError ? <p className="error-text text-kumo-danger">{connectionError}</p> : null}
         </Surface>
+        <AppToast message={toastMessage} />
       </main>
     );
   }
@@ -991,6 +963,12 @@ function App() {
               DB: {form.database.trim() || "all non-system"}
             </span>
             <span className="meta-pill bg-kumo-tint border-kumo-line">User: {form.username}</span>
+            {connectionStatus ? (
+              <span className="meta-pill status-chip bg-kumo-tint border-kumo-line">
+                {connectionStatus.connected ? "Connected" : "Disconnected"} · {connectionStatus.latencyMs}ms ·
+                v{connectionStatus.version}
+              </span>
+            ) : null}
           </div>
         </div>
         <div className="topbar-actions">
@@ -1013,6 +991,16 @@ function App() {
       </header>
 
       {connectionError ? <p className="error-text text-kumo-danger">{connectionError}</p> : null}
+
+      <div className="status-bar bg-kumo-elevated border-kumo-line text-kumo-strong">
+        <span>Active DB: {activeTab?.schema ?? connectionStatus?.currentDatabase ?? "-"}</span>
+        <span>
+          Rows: {activeTab ? activeTab.preview.rows.length.toLocaleString() : 0}
+          {activeTab?.type === "table" && activeTableMeta?.rowCount !== null
+            ? ` / ${activeTableMeta?.rowCount.toLocaleString()} est.`
+            : ""}
+        </span>
+      </div>
 
       <section className="viewer-layout">
         <Surface as="aside" className="panel explorer-panel bg-kumo-elevated border-kumo-line">
@@ -1049,19 +1037,22 @@ function App() {
                         const isActive =
                           activeTab?.type === "table" &&
                           activeTab.schema === schema.schema &&
-                          activeTab.table === table;
+                          activeTab.table === table.name;
 
                         return (
                           <button
-                            key={`${schema.schema}.${table}`}
+                            key={`${schema.schema}.${table.name}`}
                             className={isActive ? "tree-item table-item active" : "tree-item table-item"}
                             onClick={() => {
-                              openTableInNewTab(schema.schema, table);
+                              openTableInNewTab(schema.schema, table.name);
                             }}
                           >
                             <span className="tree-item-main">
                               <TableIcon size={14} weight="duotone" />
-                              <span>{table}</span>
+                              <span>{table.name}</span>
+                            </span>
+                            <span className="table-badge bg-kumo-tint text-kumo-strong">
+                              {table.rowCount === null ? "-" : table.rowCount.toLocaleString()}
                             </span>
                           </button>
                         );
@@ -1113,10 +1104,7 @@ function App() {
                 ),
               }))}
               value={activeTabId ?? undefined}
-              onValueChange={(value) => {
-                setActiveTabId(value);
-                closeAutocomplete();
-              }}
+              onValueChange={(value) => setActiveTabId(value)}
               className="workspace-tabs"
             />
             <Button
@@ -1127,118 +1115,78 @@ function App() {
               className="no-ring !border-kumo-line !ring-0 focus-visible:!ring-0 focus:!ring-0"
               onClick={createQueryTab}
             />
+            <TabActions
+              disabled={!activeTab}
+              onRename={renameActiveTab}
+              onDuplicate={duplicateActiveTab}
+              onCloseOthers={closeOtherTabs}
+              onCloseAll={closeAllTabs}
+            />
           </div>
 
           {activeTab ? (
-            <>
+            <div className="workspace-content">
               {activeTab.type === "query" ? (
-                <div className="query-editor-wrap">
-                  <div className="query-editor-shell bg-kumo-control border-kumo-line">
-                    <pre
-                      ref={highlightRef}
-                      className="query-highlight"
-                      aria-hidden="true"
-                      dangerouslySetInnerHTML={{ __html: `${highlightedSql}\n` }}
-                    />
-                    <textarea
-                      ref={editorRef}
-                      value={activeTab.query}
-                      onChange={(event) => {
-                        const query = event.currentTarget.value;
-                        const cursor = event.currentTarget.selectionStart ?? query.length;
-                        updateTab(activeTab.id, (tab) => ({ ...tab, query }));
-                        refreshAutocomplete(query, cursor, false, event.currentTarget);
-                      }}
-                      onKeyDown={onQueryEditorKeyDown}
-                      onClick={(event) => {
-                        const cursor = event.currentTarget.selectionStart ?? activeTab.query.length;
-                        refreshAutocomplete(activeTab.query, cursor, false, event.currentTarget);
-                      }}
-                      onScroll={syncQueryScroll}
-                      wrap="off"
-                      spellCheck={false}
-                      aria-label="SQL query"
-                      className="query-editor"
-                    />
-                    {autocomplete.open ? (
-                      <div
-                        className="query-autocomplete bg-kumo-elevated border-kumo-line"
-                        style={{ left: `${autocompletePosition.left}px`, top: `${autocompletePosition.top}px` }}
-                      >
-                        {autocomplete.items.map((item, index) => (
-                          <button
-                            key={`${item}-${index}`}
-                            className={
-                              index === autocomplete.selectedIndex
-                                ? "autocomplete-item active"
-                                : "autocomplete-item"
-                            }
-                            onMouseDown={(event) => {
-                              event.preventDefault();
-                            }}
-                            onClick={() => {
-                              applyAutocompleteSuggestion(item);
-                            }}
-                          >
-                            {item}
-                          </button>
-                        ))}
-                      </div>
-                    ) : null}
-                  </div>
-                  <Button
-                    variant="primary"
-                    icon={Play}
-                    loading={activeTab.isLoading}
-                    onClick={() => {
-                      void runActiveQuery();
-                    }}
-                    className="no-ring !ring-0 focus-visible:!ring-0 focus:!ring-0"
-                  >
-                    Run Query
-                  </Button>
-                </div>
+                <QueryEditor
+                  query={activeTab.query}
+                  isLoading={activeTab.isLoading}
+                  lastRunMs={activeTab.lastRunMs}
+                  lastRowCount={activeTab.lastRowCount}
+                  autocompleteTokens={autocompleteTokens}
+                  queryHistory={queryHistory}
+                  onChangeQuery={(query) => {
+                    updateTab(activeTab.id, (tab) => ({ ...tab, query }));
+                  }}
+                  onRun={() => {
+                    void runActiveQuery();
+                  }}
+                />
               ) : null}
 
-              {activeTab.error ? <p className="error-text text-kumo-danger">{activeTab.error}</p> : null}
-              {activeTab.isLoading ? (
-                <p className="empty-state text-kumo-subtle">Loading results...</p>
-              ) : null}
-
-              {!activeTab.isLoading && activeTab.preview.columns.length > 0 ? (
-                <div className="table-wrap">
-                  <KumoTable className="data-table" layout="auto">
-                    <KumoTable.Header>
-                      <KumoTable.Row>
-                        {activeTab.preview.columns.map((column) => (
-                          <KumoTable.Head key={column}>{column}</KumoTable.Head>
-                        ))}
-                      </KumoTable.Row>
-                    </KumoTable.Header>
-                    <KumoTable.Body>
-                      {activeTab.preview.rows.map((row, index) => (
-                        <KumoTable.Row key={`row-${index}`}>
-                          {activeTab.preview.columns.map((column) => (
-                            <KumoTable.Cell key={`${index}-${column}`}>
-                              {formatCellValue(row[column])}
-                            </KumoTable.Cell>
-                          ))}
-                        </KumoTable.Row>
-                      ))}
-                    </KumoTable.Body>
-                  </KumoTable>
-                </div>
-              ) : null}
-
-              {!activeTab.isLoading && activeTab.preview.columns.length === 0 && !activeTab.error ? (
-                <p className="empty-state text-kumo-subtle">No rows to show for this tab.</p>
-              ) : null}
-            </>
+              <ResultTable
+                activeTab={activeTab}
+                onRetry={() => {
+                  if (activeTab.type === "query") {
+                    void runActiveQuery();
+                  } else if (activeTab.schema && activeTab.table) {
+                    void loadTablePreviewIntoTab(activeTab.id, activeTab.schema, activeTab.table);
+                  }
+                }}
+                onCreateQueryTab={createQueryTab}
+                onRefreshSchemas={refreshViewer}
+                onSortColumn={(column) => {
+                  void sortActiveTabByColumn(column);
+                }}
+                onCopyCell={(value, column) => {
+                  void navigator.clipboard.writeText(value);
+                  showToast(`Copied ${column}`);
+                }}
+              />
+            </div>
           ) : (
-            <p className="empty-state text-kumo-subtle">Open a table or create a query tab to begin.</p>
+            <div className="empty-state-panel bg-kumo-tint border-kumo-line">
+              <p className="empty-state text-kumo-subtle">Open a table or create a query tab to begin.</p>
+              <div className="empty-state-actions">
+                <Button
+                  variant="secondary"
+                  className="no-ring !border-kumo-line !ring-0 focus-visible:!ring-0 focus:!ring-0"
+                  onClick={createQueryTab}
+                >
+                  Create Query Tab
+                </Button>
+                <Button
+                  variant="secondary"
+                  className="no-ring !border-kumo-line !ring-0 focus-visible:!ring-0 focus:!ring-0"
+                  onClick={refreshViewer}
+                >
+                  Refresh Schemas
+                </Button>
+              </div>
+            </div>
           )}
         </Surface>
       </section>
+      <AppToast message={toastMessage} />
     </main>
   );
 }
